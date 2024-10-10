@@ -412,9 +412,9 @@ def generate_chat_conv(
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
                 if num_image_url > 1:
-                    image_token = "<image>"
+                    image_token = "<image>" if conv.name != "qwen2-vl" else "<|vision_start|><|image_pad|><|vision_end|>"
                 else:
-                    image_token = "<image>\n"
+                    image_token = "<image>\n" if conv.name != "qwen2-vl" else "<|vision_start|><|image_pad|><|vision_end|>"
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
@@ -519,5 +519,18 @@ register_conv_template(
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep="\n",
         stop_str=["<|im_end|>", "<|action_end|>"],
+    )
+)
+
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
+register_conv_template(
+    Conversation(
+        name="qwen2-vl",
+        system_message="You are a helpful assistant.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"]
     )
 )
