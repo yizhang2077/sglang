@@ -36,6 +36,7 @@ from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 
 import numpy as np
 import torch
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention import AttentionBackend
@@ -115,7 +116,7 @@ class ForwardBatch:
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
-    
+
     def init_multimuldal_info(self, batch: ScheduleBatch):
         self.image_inputs = [r.image_inputs for r in batch.reqs]
 
@@ -125,12 +126,10 @@ class ForwardBatch:
         mrope_positions_list = [None] * len(reqs)
         if self.forward_mode.is_decode():
             for i, req in enumerate(reqs):
-                mrope_positions_list[i] = (
-                    MRotaryEmbedding.get_next_input_positions(
-                        req.mrope_positions_delta,
-                        int(self.seq_lens[i]) - 1,
-                        int(self.seq_lens[i]),
-                    )
+                mrope_positions_list[i] = MRotaryEmbedding.get_next_input_positions(
+                    req.mrope_positions_delta,
+                    int(self.seq_lens[i]) - 1,
+                    int(self.seq_lens[i]),
                 )
         elif self.forward_mode.is_extend():
             for i, req in enumerate(reqs):
@@ -139,33 +138,31 @@ class ForwardBatch:
                     mrope_positions = [[i for i in range(self.seq_lens[i])]] * 3
                     mrope_position_delta = 0
                 else:
-                    mrope_positions, mrope_position_delta = \
+                    mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=req.fill_ids,
                             image_grid_thw=req.image_inputs.image_grid_thws,
-                            video_grid_thw= None,
+                            video_grid_thw=None,
                             image_token_id=hf_config.image_token_id,
                             video_token_id=hf_config.video_token_id,
                             vision_start_token_id=hf_config.vision_start_token_id,
                             vision_end_token_id=hf_config.vision_end_token_id,
-                            spatial_merge_size=hf_config.vision_config.
-                            spatial_merge_size,
-                            context_len= 0,
+                            spatial_merge_size=hf_config.vision_config.spatial_merge_size,
+                            context_len=0,
                         )
+                    )
                 mrope_positions_list[i] = mrope_positions
                 req.mrope_positions_delta = mrope_position_delta
-        
+
         self.mrope_positions = torch.tensor(
             np.concatenate(
-                [
-                    np.array(pos) for pos in mrope_positions_list
-                ],
-                axis = 1,
+                [np.array(pos) for pos in mrope_positions_list],
+                axis=1,
             ),
-            device= "cuda",
+            device="cuda",
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
-        
+
     def compute_positions(self, batch: ScheduleBatch):
         if self.forward_mode.is_decode():
             self.positions = (self.seq_lens - 1).to(torch.int64)
@@ -196,8 +193,6 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-        device = "cuda"
-
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
