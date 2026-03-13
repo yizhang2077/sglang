@@ -431,7 +431,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         self.variance_epsilon = eps
 
         # Re-dispatch
-        if _is_hip:
+        if _is_hip or get_global_server_args().rl_on_policy_target == "fsdp":
             self._forward_method = self.forward_native
 
     def _forward_impl(

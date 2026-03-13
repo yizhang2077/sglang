@@ -3048,6 +3048,7 @@ class ServerArgs:
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
 
         if self.enable_deterministic_inference:
+            self.enable_flashinfer_allreduce_fusion = False
             if self.enable_aiter_allreduce_fusion:
                 logger.warning(
                     "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."

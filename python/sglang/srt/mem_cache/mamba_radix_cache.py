@@ -402,7 +402,7 @@ class MambaRadixCache(BasePrefixCache):
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
 
-        self.page_size = params.page_size
+        self.page_size = FLA_CHUNK_SIZE # For dvr
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
 
@@ -1020,6 +1020,16 @@ class MambaRadixCache(BasePrefixCache):
         else:
             mamba_branching_seqlen = None
 
+        # DVR ignore branching point
+        mamba_branching_seqlen = None
+
+        if cow_mamba:
+            return MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                mamba_branching_seqlen=mamba_branching_seqlen,
+            )
         # Copy mamba state to req local space if cow is true
         if cow_mamba and last_node.mamba_value is not None:
             # for reqs without mamba cache

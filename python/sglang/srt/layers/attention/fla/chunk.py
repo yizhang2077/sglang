@@ -33,6 +33,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    inplace_update: bool = True,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
@@ -48,7 +49,7 @@ def chunk_gated_delta_rule_fwd(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
     )
-    h, v_new = chunk_gated_delta_rule_fwd_h(
+    h, v_new, h_fp32 = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
         u=u,
@@ -56,6 +57,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        inplace_update=inplace_update,
     )
     o = chunk_fwd_o(
         q=q,
@@ -67,9 +69,9 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
     )
     if SUPPRESS_LEVEL < 3:
-        return g, o, A, None, h, None
+        return g, o, A, None, h_fp32, None
     elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, w, h, v_new
+        return g, o, A, w, h_fp32, v_new
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -89,6 +91,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state_indices: torch.Tensor,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
+        inplace_update: bool = True,
     ):
         q_orig = q
         k_orig = k
@@ -107,6 +110,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             initial_state_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
+            inplace_update=inplace_update,
         )
         return o.to(q.dtype), h
 
@@ -124,6 +128,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    inplace_update: bool = True,
 ):
     r"""
     Args:
@@ -238,6 +243,7 @@ def chunk_gated_delta_rule(
         initial_state_indices,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        inplace_update,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

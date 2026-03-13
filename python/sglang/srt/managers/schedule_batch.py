@@ -1763,6 +1763,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+            assert (
+                req.mamba_last_track_seqlen <= mamba_track_seqlen
+                and req.mamba_last_track_seqlen + FLA_CHUNK_SIZE > mamba_track_seqlen
+                and req.mamba_last_track_seqlen % mamba_cache_chunk_size == 0
+            )
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
     def prepare_for_split_prefill(self):

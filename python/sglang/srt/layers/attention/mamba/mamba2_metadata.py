@@ -27,6 +27,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    chunk_indices_with_16: Optional[torch.Tensor] = None
+    chunk_indices_with_64: Optional[torch.Tensor] = None
+    chunk_indices_with_o: Optional[torch.Tensor] = None
+    chunk_offsets_with_64: Optional[torch.Tensor] = None
+
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
