@@ -395,6 +395,7 @@ def solve_tril(
     A: torch.Tensor,
     cu_seqlens: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.float,
+    forward_metadata=None,
 ) -> torch.Tensor:
     """
     Compute the inverse of the lower triangular matrix
@@ -419,9 +420,12 @@ def solve_tril(
         B, T, H, 16, device=A.device, dtype=torch.float if BT != 16 else output_dtype
     )
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
-    )
+    if forward_metadata is not None:
+        chunk_indices = forward_metadata.chunk_indices_with_16
+    else:
+        chunk_indices = (
+            prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
+        )
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, 16)
     solve_tril_16x16_kernel[NT, B * H](
         A=A,
@@ -444,9 +448,12 @@ def solve_tril(
         if BT == 32
         else merge_16x16_to_64x64_inverse_kernel
     )
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if forward_metadata is not None:
+        chunk_indices = forward_metadata.chunk_indices_with_64
+    else:
+        chunk_indices = (
+            prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+        )
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
     merge_fn[NT, B * H](
         A=A,

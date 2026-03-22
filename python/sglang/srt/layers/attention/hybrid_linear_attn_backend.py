@@ -11,11 +11,12 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
-from sglang.srt.layers.attention.fla.fused_recurrent import (
-    fused_recurrent_gated_delta_rule_update,
-)
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
+)
+from sglang.srt.layers.attention.fla.index import (
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
 )
 from sglang.srt.layers.attention.fla.kda import chunk_kda
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
@@ -28,6 +29,9 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
+from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter_with_mask,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
@@ -36,29 +40,29 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import rank0_log
 
-if is_cuda():
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_fn as causal_conv1d_fn_cuda,
-    )
+# if is_cuda():
+#     from sglang.srt.layers.attention.mamba.causal_conv1d import (
+#         causal_conv1d_fn as causal_conv1d_fn_cuda,
+#     )
 
-    causal_conv1d_fn = causal_conv1d_fn_cuda
-elif is_npu():
-    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
-        fused_sigmoid_gating_delta_rule_update_npu,
-    )
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
+#     causal_conv1d_fn = causal_conv1d_fn_cuda
+# elif is_npu():
+#     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
+#     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
+#         fused_sigmoid_gating_delta_rule_update_npu,
+#     )
+#     from sgl_kernel_npu.mamba.causal_conv1d import (
+#         causal_conv1d_fn_npu,
+#         causal_conv1d_update_npu,
+#     )
 
-    chunk_gated_delta_rule = chunk_gated_delta_rule_npu
-    fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
-    causal_conv1d_fn = causal_conv1d_fn_npu
-    causal_conv1d_update = causal_conv1d_update_npu
+#     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
+#     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
+#     causal_conv1d_fn = causal_conv1d_fn_npu
+#     causal_conv1d_update = causal_conv1d_update_npu
 
 
 # Kernel to track mamba states if needed based on track mask
@@ -190,6 +194,10 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        chunk_indices_with_16 = None
+        chunk_indices_with_64 = None
+        chunk_indices_with_o = None
+        chunk_offsets_with_64 = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -203,11 +211,27 @@ class MambaAttnBackendBase(AttentionBackend):
             if forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
                     0,
-                    forward_batch.input_ids.shape[0] + 1,
-                    step=forward_batch.spec_info.draft_token_num,
+                    bs * (forward_batch.spec_info.draft_token_num + FLA_CHUNK_SIZE) + 1,
+                    # forward_batch.input_ids.shape[0] + 1,
+                    step=forward_batch.spec_info.draft_token_num + FLA_CHUNK_SIZE,
                     dtype=torch.int32,
                     device=forward_batch.input_ids.device,
                 )
+                chunk_indices_with_16 = prepare_chunk_indices(query_start_loc, 16)
+                chunk_indices_with_64 = prepare_chunk_indices(query_start_loc, 64)
+                chunk_offsets_with_64 = prepare_chunk_offsets(query_start_loc, 64)
+                BT = min(
+                    64,
+                    # max(16, triton.next_power_of_2(forward_batch.input_ids.shape[0])),
+                    max(
+                        16,
+                        triton.next_power_of_2(
+                            bs
+                            * (forward_batch.spec_info.draft_token_num + FLA_CHUNK_SIZE)
+                        ),
+                    ),
+                )
+                chunk_indices_with_o = prepare_chunk_indices(query_start_loc, BT)
 
                 if forward_batch.spec_info.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
@@ -252,6 +276,10 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            chunk_indices_with_16=chunk_indices_with_16,
+            chunk_indices_with_64=chunk_indices_with_64,
+            chunk_offsets_with_64=chunk_offsets_with_64,
+            chunk_indices_with_o=chunk_indices_with_o,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -442,11 +470,41 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         self.cached_cuda_graph_verify_query_start_loc = torch.arange(
             0,
-            max_bs * draft_token_num + 1,
-            step=draft_token_num,
+            max_bs * (draft_token_num + FLA_CHUNK_SIZE) + 1,
+            step=draft_token_num + FLA_CHUNK_SIZE,
             dtype=torch.int32,
             device=self.device,
         )
+
+        self.cached_cuda_graph_chunk_indices_with_16 = []
+        self.cached_cuda_graph_chunk_indices_with_64 = []
+        self.cached_cuda_graph_chunk_offsets_with_64 = []
+        self.cached_cuda_graph_chunk_indices_with_o = []
+        for i in range(1, max_bs + 1):
+            BT = min(
+                64,
+                max(16, triton.next_power_of_2(i * (draft_token_num + FLA_CHUNK_SIZE))),
+            )
+            self.cached_cuda_graph_chunk_indices_with_16.append(
+                prepare_chunk_indices(
+                    self.cached_cuda_graph_verify_query_start_loc[: i + 1], 16
+                )
+            )
+            self.cached_cuda_graph_chunk_indices_with_64.append(
+                prepare_chunk_indices(
+                    self.cached_cuda_graph_verify_query_start_loc[: i + 1], 64
+                )
+            )
+            self.cached_cuda_graph_chunk_offsets_with_64.append(
+                prepare_chunk_offsets(
+                    self.cached_cuda_graph_verify_query_start_loc[: i + 1], 64
+                )
+            )
+            self.cached_cuda_graph_chunk_indices_with_o.append(
+                prepare_chunk_indices(
+                    self.cached_cuda_graph_verify_query_start_loc[: i + 1], BT
+                )
+            )
 
     def _capture_metadata(
         self,
@@ -455,6 +513,10 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        chunk_indices_with_16 = None
+        chunk_indices_with_64 = None
+        chunk_indices_with_o = None
+        chunk_offsets_with_64 = None
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
@@ -463,6 +525,10 @@ class MambaAttnBackendBase(AttentionBackend):
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
+            chunk_indices_with_16 = self.cached_cuda_graph_chunk_indices_with_16[bs - 1]
+            chunk_indices_with_64 = self.cached_cuda_graph_chunk_indices_with_64[bs - 1]
+            chunk_offsets_with_64 = self.cached_cuda_graph_chunk_offsets_with_64[bs - 1]
+            chunk_indices_with_o = self.cached_cuda_graph_chunk_indices_with_o[bs - 1]
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -484,6 +550,10 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                chunk_indices_with_16=chunk_indices_with_16,
+                chunk_indices_with_64=chunk_indices_with_64,
+                chunk_indices_with_o=chunk_indices_with_o,
+                chunk_offsets_with_64=chunk_offsets_with_64,
             )
 
     def _replay_metadata(
@@ -497,6 +567,10 @@ class MambaAttnBackendBase(AttentionBackend):
         num_padding = torch.count_nonzero(
             seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
         )
+        chunk_indices_with_16 = None
+        chunk_indices_with_64 = None
+        chunk_offsets_with_64 = None
+        chunk_indices_with_o = None
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -519,6 +593,19 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
+                chunk_indices_with_16 = self.cached_cuda_graph_chunk_indices_with_16[
+                    bs - 1
+                ]
+                chunk_indices_with_64 = self.cached_cuda_graph_chunk_indices_with_64[
+                    bs - 1
+                ]
+                chunk_indices_with_o = self.cached_cuda_graph_chunk_indices_with_o[
+                    bs - 1
+                ]
+                chunk_offsets_with_64 = self.cached_cuda_graph_chunk_offsets_with_64[
+                    bs - 1
+                ]
+
             else:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
@@ -526,6 +613,23 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
                     (bs - num_padding) * spec_info.draft_token_num
                 )
+                chunk_indices_with_16 = self.cached_cuda_graph_chunk_indices_with_16[
+                    bs - 1
+                ]
+                chunk_indices_with_64 = self.cached_cuda_graph_chunk_indices_with_64[
+                    bs - 1
+                ]
+                chunk_indices_with_o = self.cached_cuda_graph_chunk_indices_with_o[
+                    bs - 1
+                ]
+                chunk_offsets_with_64 = self.cached_cuda_graph_chunk_offsets_with_64[
+                    bs - 1
+                ]
+                chunk_indices_with_16[bs - num_padding :].fill_(-1)
+                chunk_indices_with_64[bs - num_padding :].fill_(-1)
+                chunk_indices_with_o[bs - num_padding :].fill_(-1)
+                chunk_offsets_with_64[bs - num_padding :].fill_(-1)
+                # print(f"{bs=} {num_padding=} {chunk_indices_with_16=} {chunk_indices_with_64=} {chunk_indices_with_o=}")
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
@@ -549,6 +653,10 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                chunk_indices_with_16=chunk_indices_with_16,
+                chunk_indices_with_64=chunk_indices_with_64,
+                chunk_offsets_with_64=chunk_offsets_with_64,
+                chunk_indices_with_o=chunk_indices_with_o,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -897,9 +1005,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             softplus_threshold=20.0,
         )
 
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
-        )
+        # For DVR, tracking decode is unnecessary
+        # self._track_mamba_state_decode(
+        #     forward_batch, conv_states, ssm_states, cache_indices
+        # )
 
         return core_attn_out
 
@@ -937,7 +1046,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            intermediate_state_cache = mamba_cache_params.intermediate_ssm
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
@@ -1019,22 +1127,79 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
+        if get_global_server_args().speculative_num_draft_tokens is not None:
+            intermediate_q_state_cache = mamba_cache_params.intermediate_q_state_cache
+            intermediate_k_state_cache = mamba_cache_params.intermediate_k_state_cache
+            intermediate_v_state_cache = mamba_cache_params.intermediate_v_state_cache
+            intermediate_beta_state_cache = (
+                mamba_cache_params.intermediate_beta_state_cache
+            )
+            intermediate_g_state_cache = mamba_cache_params.intermediate_g_state_cache
+            intermediate_kvug_pos = mamba_cache_params.intermediate_kvug_pos
         if is_target_verify:
-            core_attn_out = fused_recurrent_gated_delta_rule_update(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
+            prefix_len = intermediate_kvug_pos[cache_indices]
+            extend_len = forward_batch.spec_info.draft_token_num
+
+            row = cache_indices.unsqueeze(1).expand(-1, extend_len)
+            col = torch.arange(
+                extend_len, device=intermediate_q_state_cache.device
+            ).unsqueeze(0) + prefix_len.unsqueeze(1)
+
+            intermediate_q_state_cache[row, col] = query.view(
+                -1, extend_len, num_heads, head_k_dim
+            )
+            intermediate_k_state_cache[row, col] = key.view(
+                -1, extend_len, num_heads, head_k_dim
+            )
+            intermediate_v_state_cache[row, col] = value.view(
+                -1, extend_len, num_value_heads, head_v_dim
+            )
+            intermediate_beta_state_cache[row, col] = beta.view(
+                -1, extend_len, num_value_heads
+            )
+            intermediate_g_state_cache[row, col] = g.view(
+                -1, extend_len, num_value_heads
+            )
+
+            core_attn_out = chunk_gated_delta_rule(
+                q=intermediate_q_state_cache[cache_indices].view(
+                    1, -1, num_heads, head_k_dim
+                ),
+                k=intermediate_k_state_cache[cache_indices].view(
+                    1, -1, num_heads, head_k_dim
+                ),
+                v=intermediate_v_state_cache[cache_indices].view(
+                    1, -1, num_value_heads, head_v_dim
+                ),
+                g=intermediate_g_state_cache[cache_indices].view(
+                    1, -1, num_value_heads
+                ),
+                beta=intermediate_beta_state_cache[cache_indices].view(
+                    1, -1, num_value_heads
+                ),
+                initial_state=ssm_states,
+                initial_state_indices=forward_batch.mamba_track_indices[:batch_size],
                 cu_seqlens=query_start_loc,
+                head_first=False,
                 use_qk_l2norm_in_kernel=True,
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
+                forward_metadata=forward_metadata,
+                inplace_update=False,
+            )[0]
+            core_attn_out = core_attn_out.view(
+                batch_size,
+                extend_len + FLA_CHUNK_SIZE,
+                num_value_heads,
+                head_v_dim,
+            )
+            row = (
+                torch.arange(batch_size, device=core_attn_out.device)
+                .unsqueeze(1)
+                .expand(-1, extend_len)
+            )
+            core_attn_out = (
+                core_attn_out[row, col]
+                .view(1, -1, num_value_heads, head_v_dim)
+                .contiguous()
             )
         else:
             # Only cuda env uses fuse ssm_states update
@@ -1061,9 +1226,34 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            self._track_mamba_state_extend(
-                forward_batch, h, ssm_states, forward_metadata
-            )
+            if h is not None:
+                self._track_mamba_state_extend(
+                    forward_batch, h, ssm_states, forward_metadata
+                )
+
+            if get_global_server_args().speculative_num_draft_tokens is not None:
+                intermediate_kvug_pos = mamba_cache_params.intermediate_kvug_pos
+                for i, extend_len in enumerate(forward_batch.extend_seq_lens):
+                    extend_len = extend_len % FLA_CHUNK_SIZE
+                    start = query_start_loc[i + 1] - extend_len
+                    end = query_start_loc[i + 1]
+                    if extend_len > 0:
+                        intermediate_q_state_cache[cache_indices[i], :extend_len] = (
+                            query[:, start:end]
+                        )
+                        intermediate_k_state_cache[cache_indices[i], :extend_len] = key[
+                            :, start:end
+                        ]
+                        intermediate_v_state_cache[cache_indices[i], :extend_len] = (
+                            value[:, start:end]
+                        )
+                        intermediate_beta_state_cache[cache_indices[i], :extend_len] = (
+                            beta[:, start:end]
+                        )
+                        intermediate_g_state_cache[cache_indices[i], :extend_len] = g[
+                            :, start:end
+                        ]
+                        intermediate_kvug_pos[cache_indices[i]] = extend_len
 
         return core_attn_out
 
@@ -1363,44 +1553,696 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
+
+        valid_mask = accepted_steps >= 0
+        dst_state_indices = state_indices_tensor.to(torch.int64)  # [N]
+        # [bs, accept len, dim]
+        intermediate_q_state_cache = mamba_caches.intermediate_q_state_cache
+        intermediate_k_state_cache = mamba_caches.intermediate_k_state_cache
+        intermediate_v_state_cache = mamba_caches.intermediate_v_state_cache
+        intermediate_beta_state_cache = mamba_caches.intermediate_beta_state_cache
+        intermediate_g_state_cache = mamba_caches.intermediate_g_state_cache
+        intermediate_kvug_pos = mamba_caches.intermediate_kvug_pos
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Compute common indices once to avoid duplication
-        valid_mask = accepted_steps >= 0
-        dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
-        src_state_indices = intermediate_state_indices[valid_mask].to(
-            torch.int64
-        )  # [N]
-        last_steps = accepted_steps[valid_mask].to(torch.int64)  # [N]
+        draft_tokens_length = get_global_server_args().speculative_num_draft_tokens
 
-        # scatter into ssm_states at the chosen cache lines
-        ssm_states[:, dst_state_indices, :] = intermediate_state_cache[
-            :, src_state_indices, last_steps
-        ].to(ssm_states.dtype, copy=False)
+        layer = intermediate_k_state_cache.shape[0]
+        query_start_loc = torch.arange(
+            0,
+            (draft_tokens_length + FLA_CHUNK_SIZE) * request_number + 1,
+            draft_tokens_length + FLA_CHUNK_SIZE,
+            device=dst_state_indices.device,
+        )
+        # 1. update kvug positions and clean buffers larger than accepted steps
+        intermediate_kvug_pos[:, dst_state_indices] += accepted_steps + 1
+        gdn_kuwg_start_pos = intermediate_kvug_pos[0, dst_state_indices]
 
-        # Scatter into conv_states at the chosen cache lines
-        conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
-            :, src_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        buffer_list = [
+            intermediate_q_state_cache,
+            intermediate_k_state_cache,
+            intermediate_v_state_cache,
+            intermediate_beta_state_cache,
+            intermediate_g_state_cache,
+        ]
 
-        # Track indices used for tracking mamba states for prefix cache
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-            track_mask = mamba_steps_to_track >= 0
-            track_steps = mamba_steps_to_track[track_mask].to(torch.int64)  # [N]
-            if track_steps.numel() == 0:
-                # No track indices to update
-                return
-            dst_track_indices = mamba_track_indices[track_mask].to(torch.int64)
-            src_track_indices = intermediate_state_indices[track_mask].to(torch.int64)
+        clear_buffers(
+            buffer_list,
+            intermediate_kvug_pos,
+            dst_state_indices,
+        )
 
-            # scatter into ssm_states at the chosen track states
-            ssm_states[:, dst_track_indices, :] = intermediate_state_cache[
-                :, src_track_indices, track_steps
-            ].to(ssm_states.dtype, copy=False)
+        Hg, H, K, V = (
+            intermediate_k_state_cache.shape[3],
+            intermediate_v_state_cache.shape[3],
+            intermediate_k_state_cache.shape[4],
+            intermediate_v_state_cache.shape[4],
+        )
 
-            # scatter into conv_states at the chosen track states
-            conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
-                :, src_track_indices, track_steps
-            ].to(conv_states.dtype, copy=False)
+        # 2. update conv states for all requests using
+        fused_mamba_state_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window_cache,
+            state_indices_tensor,
+            accepted_steps,
+        )
+
+        # 3. Compact mamba states if needed
+        kuwg_mask = (gdn_kuwg_start_pos >= FLA_CHUNK_SIZE).unsqueeze(1)
+        kuwg_mask = kuwg_mask & (
+            (
+                torch.arange(
+                    FLA_CHUNK_SIZE + draft_tokens_length, device=accepted_steps.device
+                )
+                < FLA_CHUNK_SIZE
+            ).unsqueeze(0)
+        )
+
+        kuwg_mask.unsqueeze_(-1)
+        q = intermediate_q_state_cache[:, dst_state_indices, :]
+        k = intermediate_k_state_cache[:, dst_state_indices, :] * kuwg_mask.unsqueeze(
+            0
+        ).unsqueeze(-1)
+        v = intermediate_v_state_cache[:, dst_state_indices, :] * kuwg_mask.unsqueeze(
+            0
+        ).unsqueeze(-1)
+        g = intermediate_g_state_cache[:, dst_state_indices, :] * kuwg_mask.unsqueeze(0)
+        beta = intermediate_beta_state_cache[
+            :, dst_state_indices, :
+        ] * kuwg_mask.unsqueeze(0)
+
+        q_fused = q.view(1, -1, Hg, K)
+        k_fused = k.view(1, -1, Hg, K)
+        v_fused = v.view(1, -1, H, V)
+        g_fused = g.view(1, -1, H)
+        beta_fused = beta.view(1, -1, H)
+        ssm_states_fused = ssm_states.view(
+            -1, ssm_states.shape[2], ssm_states.shape[3], ssm_states.shape[4]
+        )
+        query_len_per_layer = query_start_loc[-1]
+        cu_seqlens_fused = torch.cat(
+            [query_start_loc[1:] + l * query_len_per_layer for l in range(layer)]
+        )
+        cu_seqlens_fused = torch.cat(
+            [torch.tensor([0], device=cu_seqlens_fused.device), cu_seqlens_fused]
+        )
+        mamba_track_indices_fused = torch.cat(
+            [mamba_track_indices + l * ssm_states.shape[1] for l in range(layer)]
+        )
+
+        chunk_gated_delta_rule(
+            q=q_fused,
+            k=k_fused,
+            v=v_fused,
+            g=g_fused,
+            beta=beta_fused,
+            initial_state=ssm_states_fused,
+            initial_state_indices=mamba_track_indices_fused,
+            cu_seqlens=cu_seqlens_fused,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # 4. update tracked conv states if needed
+        fused_mamba_state_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window_cache,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+
+        # 5. update buffer by shifting if needed
+        shift_buffers(
+            buffer_list,
+            intermediate_kvug_pos,
+            dst_state_indices,
+            draft_tokens_length,
+            FLA_CHUNK_SIZE,
+        )
+
+        # 6. Update ssm states for decode stage
+        # build mask: accept steps >= 0 and position < gdn_kuwg_start_pos
+        if get_global_server_args().speculative_algorithm != "DECODE_VERIFY_ROLLBACK":
+            return
+
+        kuwg_mask = torch.arange(
+            draft_tokens_length + FLA_CHUNK_SIZE, device=dst_state_indices.device
+        ).unsqueeze(0) < gdn_kuwg_start_pos.unsqueeze(1)
+        kuwg_mask.unsqueeze_(-1)
+
+        k = intermediate_k_state_cache[:, dst_state_indices, :] * kuwg_mask.unsqueeze(
+            0
+        ).unsqueeze(-1)
+        v = intermediate_v_state_cache[:, dst_state_indices, :] * kuwg_mask.unsqueeze(
+            0
+        ).unsqueeze(-1)
+        g = intermediate_g_state_cache[:, dst_state_indices, :] * kuwg_mask.unsqueeze(0)
+        beta = intermediate_beta_state_cache[
+            :, dst_state_indices, :
+        ] * kuwg_mask.unsqueeze(0)
+
+        ssm_states[:, dst_state_indices, :] = ssm_states[:, mamba_track_indices]
+
+        q_fused = q.view(1, -1, Hg, K)
+        k_fused = k.view(1, -1, Hg, K)
+        v_fused = v.view(1, -1, H, V)
+        g_fused = g.view(1, -1, H)
+        beta_fused = beta.view(1, -1, H)
+        dst_state_indices_fused = torch.cat(
+            [dst_state_indices + l * ssm_states.shape[1] for l in range(layer)]
+        )
+        chunk_gated_delta_rule(
+            q=q_fused,
+            k=k_fused,
+            v=v_fused,
+            g=g_fused,
+            beta=beta_fused,
+            initial_state=ssm_states_fused,
+            initial_state_indices=dst_state_indices_fused,
+            cu_seqlens=cu_seqlens_fused,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+
+###############################################################################################
+# mixin for update_mamba_state_after_mtp_verify to clear and shift buffers using triton kernels
+###############################################################################################
+@triton.jit
+def _compute_valid_and_update_pos_kernel(
+    dst_state_indices_ptr,  # [num_requests]
+    kvug_pos_ptr,  # [num_layers, num_states]
+    valid_mask_ptr,  # [num_requests] output
+    kvug_pos_stride0,  # stride for layer dim
+    kvug_pos_stride1,  # stride for state dim
+    num_requests,
+    FLA_CHUNK_SIZE,
+):
+    """
+    Grid: (num_requests, num_layers)
+    - Each thread checks one (request, layer) pair.
+    - valid_mask is written only by layer 0 to avoid race conditions.
+    - kvug_pos is updated in-place for each layer independently.
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1)
+
+    if pid_req >= num_requests:
+        return
+
+    dst_state_idx = tl.load(dst_state_indices_ptr + pid_req)
+
+    pos_ptr = (
+        kvug_pos_ptr + pid_layer * kvug_pos_stride0 + dst_state_idx * kvug_pos_stride1
+    )
+    kvug_pos_val = tl.load(pos_ptr)
+    need_shift = kvug_pos_val >= FLA_CHUNK_SIZE
+
+    # Only layer 0 writes valid_mask to avoid race condition.
+    # This assumes all layers share the same need_shift decision,
+    # which holds when kvug_pos is updated uniformly across layers.
+    if pid_layer == 0:
+        tl.store(valid_mask_ptr + pid_req, need_shift.to(tl.int32))
+
+    if need_shift:
+        tl.store(pos_ptr, kvug_pos_val - FLA_CHUNK_SIZE)
+
+
+@triton.jit
+def _shift_5d_buffer_kernel(
+    buffer_ptr,
+    valid_mask_ptr,  # [num_requests]
+    dst_state_indices_ptr,  # [num_requests]
+    # strides for [num_layers, num_states, seq_len, heads, dim]
+    stride_layer,
+    stride_state,
+    stride_seq,
+    stride_head,
+    stride_dim,
+    # shape
+    num_layers,
+    seq_len,
+    num_heads,
+    head_dim,
+    # shift params
+    draft_tokens_length,
+    FLA_CHUNK_SIZE,
+    # block sizes
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """
+    Grid: (num_requests, num_layers, cdiv(seq_len, BLOCK_SEQ))
+
+    For each (request, layer, seq_block):
+      - Iterate over heads and dim with tl.arange blocks.
+      - Shift seq_len dimension: src[FLA_CHUNK_SIZE:FLA_CHUNK_SIZE+draft] -> dst[0:draft]
+      - Zero out dst[draft:]
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1)
+    pid_seq = tl.program_id(2)
+
+    # Check if this request needs shifting (GPU-side, no sync)
+    valid = tl.load(valid_mask_ptr + pid_req) != 0
+    if not valid:
+        return
+
+    dst_state_idx = tl.load(dst_state_indices_ptr + pid_req)
+
+    # Base pointer for this (layer, state)
+    base = pid_layer * stride_layer + dst_state_idx * stride_state
+
+    # Seq offsets for this block
+    seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+
+    # Head and dim offsets
+    head_offsets = tl.arange(0, BLOCK_HEAD)
+    dim_offsets = tl.arange(0, BLOCK_DIM)
+
+    # 3D offset grid: [BLOCK_SEQ, BLOCK_HEAD, BLOCK_DIM]
+    # Shape broadcasting: seq[:, None, None], head[None, :, None], dim[None, None, :]
+    seq_off = seq_offsets[:, None, None]  # [BLOCK_SEQ,  1,          1        ]
+    head_off = head_offsets[None, :, None]  # [1,          BLOCK_HEAD, 1        ]
+    dim_off = dim_offsets[None, None, :]  # [1,          1,          BLOCK_DIM]
+
+    # ── Copy: src[FLA_CHUNK_SIZE : FLA_CHUNK_SIZE + draft] -> dst[0 : draft] ──
+    src_seq = seq_off + FLA_CHUNK_SIZE
+    copy_mask = (
+        (seq_offsets[:, None, None] < draft_tokens_length)
+        & (src_seq < seq_len)
+        & (head_off < num_heads)
+        & (dim_off < head_dim)
+    )
+
+    src_offsets = (
+        base + src_seq * stride_seq + head_off * stride_head + dim_off * stride_dim
+    )
+    data = tl.load(buffer_ptr + src_offsets, mask=copy_mask, other=0.0)
+
+    dst_offsets = (
+        base + seq_off * stride_seq + head_off * stride_head + dim_off * stride_dim
+    )
+    tl.store(buffer_ptr + dst_offsets, data, mask=copy_mask)
+
+    # ── Zero out: dst[draft_tokens_length : seq_len] ──
+    zero_seq = seq_off + draft_tokens_length
+    zero_mask = (zero_seq < seq_len) & (head_off < num_heads) & (dim_off < head_dim)
+    zero_offsets = (
+        base + zero_seq * stride_seq + head_off * stride_head + dim_off * stride_dim
+    )
+    tl.store(
+        buffer_ptr + zero_offsets,
+        tl.zeros([BLOCK_SEQ, BLOCK_HEAD, BLOCK_DIM], dtype=buffer_ptr.dtype.element_ty),
+        mask=zero_mask,
+    )
+
+
+@triton.jit
+def _shift_4d_buffer_kernel(
+    buffer_ptr,
+    valid_mask_ptr,  # [num_requests]
+    dst_state_indices_ptr,  # [num_requests]
+    # strides for [num_layers, num_states, seq_len, heads]
+    stride_layer,
+    stride_state,
+    stride_seq,
+    stride_head,
+    # shape
+    num_layers,
+    seq_len,
+    num_heads,
+    # shift params
+    draft_tokens_length,
+    FLA_CHUNK_SIZE,
+    # block sizes
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+):
+    """
+    Grid: (num_requests, num_layers, cdiv(seq_len, BLOCK_SEQ))
+
+    Same as _shift_5d_buffer_kernel but for 4D buffers
+    (intermediate_g and intermediate_beta which have no head_dim).
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1)
+    pid_seq = tl.program_id(2)
+
+    valid = tl.load(valid_mask_ptr + pid_req) != 0
+    if not valid:
+        return
+
+    dst_state_idx = tl.load(dst_state_indices_ptr + pid_req)
+
+    base = pid_layer * stride_layer + dst_state_idx * stride_state
+
+    seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    head_offsets = tl.arange(0, BLOCK_HEAD)
+
+    seq_off = seq_offsets[:, None]  # [BLOCK_SEQ,  1         ]
+    head_off = head_offsets[None, :]  # [1,          BLOCK_HEAD]
+
+    # ── Copy ──
+    src_seq = seq_off + FLA_CHUNK_SIZE
+    copy_mask = (
+        (seq_offsets[:, None] < draft_tokens_length)
+        & (src_seq < seq_len)
+        & (head_off < num_heads)
+    )
+
+    src_offsets = base + src_seq * stride_seq + head_off * stride_head
+    data = tl.load(buffer_ptr + src_offsets, mask=copy_mask, other=0.0)
+
+    dst_offsets = base + seq_off * stride_seq + head_off * stride_head
+    tl.store(buffer_ptr + dst_offsets, data, mask=copy_mask)
+
+    # ── Zero out ──
+    zero_seq = seq_off + draft_tokens_length
+    zero_mask = (zero_seq < seq_len) & (head_off < num_heads)
+
+    zero_offsets = base + zero_seq * stride_seq + head_off * stride_head
+    tl.store(
+        buffer_ptr + zero_offsets,
+        tl.zeros([BLOCK_SEQ, BLOCK_HEAD], dtype=buffer_ptr.dtype.element_ty),
+        mask=zero_mask,
+    )
+
+
+def shift_buffers(
+    buffer_list: list[torch.Tensor],
+    # position tracker: [num_layers, num_states]
+    intermediate_kvug_pos: torch.Tensor,
+    # request info
+    dst_state_indices: torch.Tensor,  # [num_requests]
+    draft_tokens_length: int,
+    FLA_CHUNK_SIZE: int,
+    # optional pre-allocated cache
+    _valid_mask_cache: torch.Tensor = None,
+):
+    (
+        intermediate_q_state_cache,
+        intermediate_k_state_cache,
+        intermediate_v_state_cache,
+        intermediate_g_state_cache,
+        intermediate_beta_state_cache,
+    ) = buffer_list
+    num_requests = dst_state_indices.shape[0]
+    num_layers = intermediate_kvug_pos.shape[0]
+    device = dst_state_indices.device
+
+    if num_requests == 0:
+        return
+
+    # Reuse pre-allocated valid_mask if provided
+    if _valid_mask_cache is not None and _valid_mask_cache.shape[0] >= num_requests:
+        valid_mask = _valid_mask_cache[:num_requests]
+    else:
+        valid_mask = torch.empty(num_requests, dtype=torch.int32, device=device)
+
+    # ── Step 1: Compute valid_mask and update kvug_pos in-place ──
+    _compute_valid_and_update_pos_kernel[(num_requests, num_layers)](
+        dst_state_indices,
+        intermediate_kvug_pos,
+        valid_mask,
+        kvug_pos_stride0=intermediate_kvug_pos.stride(0),
+        kvug_pos_stride1=intermediate_kvug_pos.stride(1),
+        num_requests=num_requests,
+        FLA_CHUNK_SIZE=FLA_CHUNK_SIZE,
+    )
+
+    # ── Step 2: Shift 5D buffers (q, k, v) ──
+    for buf in (
+        intermediate_q_state_cache,
+        intermediate_k_state_cache,
+        intermediate_v_state_cache,
+    ):
+        num_layers_, num_states_, seq_len, num_heads, head_dim = buf.shape
+
+        BLOCK_SEQ = 1  # one seq position per thread block along seq axis
+        BLOCK_HEAD = triton.next_power_of_2(num_heads)
+        BLOCK_DIM = triton.next_power_of_2(head_dim)
+
+        grid = (
+            num_requests,
+            num_layers_,
+            triton.cdiv(draft_tokens_length + (seq_len - FLA_CHUNK_SIZE), BLOCK_SEQ),
+        )
+
+        _shift_5d_buffer_kernel[grid](
+            buf,
+            valid_mask,
+            dst_state_indices,
+            buf.stride(0),  # stride_layer
+            buf.stride(1),  # stride_state
+            buf.stride(2),  # stride_seq
+            buf.stride(3),  # stride_head
+            buf.stride(4),  # stride_dim
+            num_layers_,
+            seq_len,
+            num_heads,
+            head_dim,
+            draft_tokens_length,
+            FLA_CHUNK_SIZE,
+            BLOCK_SEQ=BLOCK_SEQ,
+            BLOCK_HEAD=BLOCK_HEAD,
+            BLOCK_DIM=BLOCK_DIM,
+        )
+
+    # ── Step 3: Shift 4D buffers (g, beta) ──
+    for buf in (
+        intermediate_g_state_cache,
+        intermediate_beta_state_cache,
+    ):
+        num_layers_, num_states_, seq_len, num_heads = buf.shape
+
+        BLOCK_SEQ = 1
+        BLOCK_HEAD = triton.next_power_of_2(num_heads)
+
+        grid = (
+            num_requests,
+            num_layers_,
+            triton.cdiv(seq_len, BLOCK_SEQ),
+        )
+
+        _shift_4d_buffer_kernel[grid](
+            buf,
+            valid_mask,
+            dst_state_indices,
+            buf.stride(0),  # stride_layer
+            buf.stride(1),  # stride_state
+            buf.stride(2),  # stride_seq
+            buf.stride(3),  # stride_head
+            num_layers_,
+            seq_len,
+            num_heads,
+            draft_tokens_length,
+            FLA_CHUNK_SIZE,
+            BLOCK_SEQ=BLOCK_SEQ,
+            BLOCK_HEAD=BLOCK_HEAD,
+        )
+
+
+@triton.jit
+def _clear_5d_buffer_kernel(
+    buffer_ptr,
+    dst_state_indices_ptr,  # [num_requests]
+    start_pos_ptr,  # [num_requests] gdn_kuwg_start_pos
+    stride_layer,
+    stride_state,
+    stride_seq,
+    stride_head,
+    stride_dim,
+    seq_len,
+    num_heads,
+    head_dim,
+    num_requests,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """
+    Grid: (num_requests, num_layers, cdiv(seq_len, BLOCK_SEQ))
+
+    Zero out buffer[:, dst_state_indices[i], start_pos[i]:, :, :]
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1)
+    pid_seq = tl.program_id(2)
+
+    dst_state_idx = tl.load(dst_state_indices_ptr + pid_req)
+    start_pos = tl.load(start_pos_ptr + pid_req)
+
+    seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    head_offsets = tl.arange(0, BLOCK_HEAD)
+    dim_offsets = tl.arange(0, BLOCK_DIM)
+
+    seq_off = seq_offsets[:, None, None]
+    head_off = head_offsets[None, :, None]
+    dim_off = dim_offsets[None, None, :]
+
+    # Only zero positions >= start_pos
+    zero_mask = (
+        (seq_off >= start_pos)
+        & (seq_off < seq_len)
+        & (head_off < num_heads)
+        & (dim_off < head_dim)
+    )
+
+    base = pid_layer * stride_layer + dst_state_idx * stride_state
+
+    offsets = (
+        base + seq_off * stride_seq + head_off * stride_head + dim_off * stride_dim
+    )
+
+    tl.store(
+        buffer_ptr + offsets,
+        tl.zeros([BLOCK_SEQ, BLOCK_HEAD, BLOCK_DIM], dtype=buffer_ptr.dtype.element_ty),
+        mask=zero_mask,
+    )
+
+
+@triton.jit
+def _clear_4d_buffer_kernel(
+    buffer_ptr,
+    dst_state_indices_ptr,  # [num_requests]
+    start_pos_ptr,  # [num_requests]
+    stride_layer,
+    stride_state,
+    stride_seq,
+    stride_head,
+    seq_len,
+    num_heads,
+    num_requests,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+):
+    """
+    Grid: (num_requests, num_layers, cdiv(seq_len, BLOCK_SEQ))
+
+    Zero out buffer[:, dst_state_indices[i], start_pos[i]:, :]
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1)
+    pid_seq = tl.program_id(2)
+
+    dst_state_idx = tl.load(dst_state_indices_ptr + pid_req)
+    start_pos = tl.load(start_pos_ptr + pid_req)
+
+    seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    head_offsets = tl.arange(0, BLOCK_HEAD)
+
+    seq_off = seq_offsets[:, None]
+    head_off = head_offsets[None, :]
+
+    zero_mask = (seq_off >= start_pos) & (seq_off < seq_len) & (head_off < num_heads)
+
+    base = pid_layer * stride_layer + dst_state_idx * stride_state
+
+    offsets = base + seq_off * stride_seq + head_off * stride_head
+
+    tl.store(
+        buffer_ptr + offsets,
+        tl.zeros([BLOCK_SEQ, BLOCK_HEAD], dtype=buffer_ptr.dtype.element_ty),
+        mask=zero_mask,
+    )
+
+
+def clear_buffers(
+    buffer_list: list[torch.Tensor],
+    intermediate_kvug_pos: torch.Tensor,  # [num_layers, num_states]
+    dst_state_indices: torch.Tensor,  # [num_requests]
+):
+    """
+    Zero out buffer[:, dst_state_indices[i], start_pos[i]:, ...] for all buffers.
+    No CPU/GPU sync.
+
+    Equivalent to:
+        gdn_kuwg_start_pos = intermediate_kvug_pos[0, dst_state_indices]
+        for i in range(request_number):
+            buffer[:, dst_state_indices[i], gdn_kuwg_start_pos[i]:] = 0
+    """
+    (
+        intermediate_q_state_cache,
+        intermediate_k_state_cache,
+        intermediate_v_state_cache,
+        intermediate_g_state_cache,
+        intermediate_beta_state_cache,
+    ) = buffer_list
+    num_requests = dst_state_indices.shape[0]
+    num_layers = intermediate_kvug_pos.shape[0]
+
+    if num_requests == 0:
+        return
+
+    # Gather start positions on GPU, no .item() / .cpu() call
+    # shape: [num_requests]
+    start_pos = intermediate_kvug_pos[0, dst_state_indices].to(torch.int32)
+
+    # ── 5D buffers: [layers, states, seq, heads, dim] ──
+    for buf in (
+        intermediate_q_state_cache,
+        intermediate_k_state_cache,
+        intermediate_v_state_cache,
+    ):
+        _, _, seq_len, num_heads, head_dim = buf.shape
+
+        BLOCK_SEQ = 1
+        BLOCK_HEAD = triton.next_power_of_2(num_heads)
+        BLOCK_DIM = triton.next_power_of_2(head_dim)
+
+        grid = (
+            num_requests,
+            num_layers,
+            triton.cdiv(seq_len, BLOCK_SEQ),
+        )
+
+        _clear_5d_buffer_kernel[grid](
+            buf,
+            dst_state_indices,
+            start_pos,
+            buf.stride(0),
+            buf.stride(1),
+            buf.stride(2),
+            buf.stride(3),
+            buf.stride(4),
+            seq_len,
+            num_heads,
+            head_dim,
+            num_requests,
+            BLOCK_SEQ=BLOCK_SEQ,
+            BLOCK_HEAD=BLOCK_HEAD,
+            BLOCK_DIM=BLOCK_DIM,
+        )
+
+    # ── 4D buffers: [layers, states, seq, heads] ──
+    for buf in (
+        intermediate_g_state_cache,
+        intermediate_beta_state_cache,
+    ):
+        _, _, seq_len, num_heads = buf.shape
+
+        BLOCK_SEQ = 1
+        BLOCK_HEAD = triton.next_power_of_2(num_heads)
+
+        grid = (
+            num_requests,
+            num_layers,
+            triton.cdiv(seq_len, BLOCK_SEQ),
+        )
+
+        _clear_4d_buffer_kernel[grid](
+            buf,
+            dst_state_indices,
+            start_pos,
+            buf.stride(0),
+            buf.stride(1),
+            buf.stride(2),
+            buf.stride(3),
+            seq_len,
+            num_heads,
+            num_requests,
+            BLOCK_SEQ=BLOCK_SEQ,
+            BLOCK_HEAD=BLOCK_HEAD,
+        )

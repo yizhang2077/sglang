@@ -36,3 +36,8 @@ python3 -m sglang.launch_server --model Qwen/Qwen3-30B-A3B --max-running-request
 
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompt 16 --random-input 1024 --random-output 12000 --random-range-ratio 1
 ```
+
+### Reproduce Command for qwen3next
+```
+SGLANG_GDN_PREFILL_TRUNCATION_ALIGN_SIZE=128 python -m sglang.launch_server --model-path Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2  --speculative-num-steps 15 --speculative-eagle-topk 1 --speculative-num-draft-tokens 16 --speculative-algo DECODE_VERIFY_ROLLBACK  --mamba-scheduler-strategy extra_buffer --disable-overlap-schedule  --mamba-track-interval 64  --mem-frac 0.8   --max-running-requests 48
+```

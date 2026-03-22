@@ -376,7 +376,7 @@ class MambaRadixCache(BasePrefixCache):
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
 
-        self.page_size = params.page_size
+        self.page_size = FLA_CHUNK_SIZE  # For DVR
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
 
@@ -450,6 +450,13 @@ class MambaRadixCache(BasePrefixCache):
 
         value, last_node, mamba_branching_seqlen = self._match_prefix_helper(key)
 
+        # if cow_mamba:
+        #     return MatchResult(
+        #         device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+        #         last_device_node=self.root_node,
+        #         last_host_node=None,
+        #         mamba_branching_seqlen=mamba_branching_seqlen,
+        #     )
         # copy mamba state to req local space if cow is true
         if cow_mamba and last_node.mamba_value is not None:
             # for reqs without mamba cache
@@ -529,6 +536,8 @@ class MambaRadixCache(BasePrefixCache):
             )
             if cache_len is None:
                 cache_len = 0
+
+            assert cache_len % 64 == 0
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
@@ -614,8 +623,11 @@ class MambaRadixCache(BasePrefixCache):
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
+
         if self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
+
+        assert cache_len % 64 == 0
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
@@ -1015,6 +1027,7 @@ class MambaRadixCache(BasePrefixCache):
         else:
             mamba_branching_seqlen = None
 
+        mamba_branching_seqlen = None  # for DVR
         return value[:best_value_len], best_last_node, mamba_branching_seqlen
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:

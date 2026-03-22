@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
 
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -187,8 +188,13 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
+        intermediate_q_state_cache: torch.Tensor
+        intermediate_k_state_cache: torch.Tensor
+        intermediate_v_state_cache: torch.Tensor
+        intermediate_beta_state_cache: torch.Tensor
+        intermediate_g_state_cache: torch.Tensor
+        intermediate_kvug_pos: torch.Tensor
 
     def __init__(
         self,
@@ -238,16 +244,68 @@ class MambaPool:
             if speculative_num_draft_tokens is not None:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
+                # intermediate_ssm_state_cache = torch.zeros_like(temporal_state)
+                # For dvr
+                intermediate_q_state_cache = torch.zeros(
                     size=(
                         num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
+                        size + 1,
+                        speculative_num_draft_tokens + FLA_CHUNK_SIZE,
+                        temporal_state_shape[0] // 2,  # query_heads
+                        temporal_state_shape[1],  # head_dim
                     ),
-                    dtype=ssm_dtype,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                intermediate_k_state_cache = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        size + 1,
+                        speculative_num_draft_tokens + FLA_CHUNK_SIZE,
+                        temporal_state_shape[0] // 2,  # key_heads
+                        temporal_state_shape[1],  # key_dim
+                    ),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                intermediate_v_state_cache = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        size + 1,
+                        speculative_num_draft_tokens + FLA_CHUNK_SIZE,
+                        temporal_state_shape[0],  # value_heads
+                        temporal_state_shape[2],  # value_dim
+                    ),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+
+                intermediate_g_state_cache = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        size + 1,
+                        speculative_num_draft_tokens + FLA_CHUNK_SIZE,
+                        temporal_state_shape[0],  # value_heads
+                    ),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                intermediate_beta_state_cache = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        size + 1,
+                        speculative_num_draft_tokens + FLA_CHUNK_SIZE,
+                        temporal_state_shape[0],  # value_heads
+                    ),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                intermediate_kvug_pos = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        size + 1,
+                    ),
+                    dtype=torch.int64,
                     device="cuda",
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
@@ -269,7 +327,12 @@ class MambaPool:
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
-                    intermediate_ssm=intermediate_ssm_state_cache,
+                    intermediate_q_state_cache=intermediate_q_state_cache,
+                    intermediate_k_state_cache=intermediate_k_state_cache,
+                    intermediate_v_state_cache=intermediate_v_state_cache,
+                    intermediate_beta_state_cache=intermediate_beta_state_cache,
+                    intermediate_g_state_cache=intermediate_g_state_cache,
+                    intermediate_kvug_pos=intermediate_kvug_pos,
                     intermediate_conv_window=intermediate_conv_window_cache,
                 )
                 logger.info(
@@ -277,7 +340,7 @@ class MambaPool:
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                    # f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
                 )
             else:
@@ -315,6 +378,14 @@ class MambaPool:
         for i in range(len(self.mamba_cache.conv)):
             self.mamba_cache.conv[i][:, select_index] = 0
         self.mamba_cache.temporal[:, select_index] = 0
+
+        if getattr(self.mamba_cache, "intermediate_q_state_cache", None) is not None:
+            self.mamba_cache.intermediate_q_state_cache[:, select_index] = 0
+            self.mamba_cache.intermediate_k_state_cache[:, select_index] = 0
+            self.mamba_cache.intermediate_v_state_cache[:, select_index] = 0
+            self.mamba_cache.intermediate_beta_state_cache[:, select_index] = 0
+            self.mamba_cache.intermediate_g_state_cache[:, select_index] = 0
+            self.mamba_cache.intermediate_kvug_pos[:, select_index] = 0
 
         return select_index
 
@@ -469,6 +540,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 if req.mamba_ping_pong_track_buffer is None:
                     req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
                         self.mamba_ping_pong_track_buffer_size
+                    )
+                    self.mamba_pool.copy_from(
+                        req.mamba_pool_idx, req.mamba_ping_pong_track_buffer[0]
                     )
                     assert (
                         req.mamba_ping_pong_track_buffer is not None

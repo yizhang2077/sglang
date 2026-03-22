@@ -1,5 +1,3 @@
-import torch
-
 import inspect
 import json
 import os
@@ -98,25 +96,24 @@ def get_input_ids(
 
 
 def compare_kl_divergence(
-    input_logprobs, output_logprobs, ACC_THRESHOLDS, model_name, test_name
+    input_ids, input_logprobs, output_logprobs, ACC_THRESHOLDS, model_name, test_name
 ):
     """Compare the KL divergence between input and output log probabilities."""
     kl_divs = []
-    max_kl_divs = []
+    i = 0
     for input_logprob, output_logprob in zip(input_logprobs, output_logprobs):
         input_logprob = np.array(input_logprob)
         output_logprob = np.array(output_logprob)
         logr = input_logprob - output_logprob
+        if np.any(logr > 0):
+            print(f"{input_ids[i]=}")
         kl_approx = (np.exp(logr) - 1) - logr
         kl_divs.append(np.mean(kl_approx))
-        max_kl_divs.append(np.max(kl_approx))
+        i += 1
 
     print(f"kl_divs={kl_divs}")
-    print(f"max_kl_divs={max_kl_divs}")
     avg_kl_div = sum(kl_divs) / len(kl_divs)
-    max_kl_div = max(max_kl_divs)
     print(f"avg_kl_div={avg_kl_div}")
-    print(f"max_kl_div={max_kl_div}")
     print(f"ACC_THRESHOLDS={ACC_THRESHOLDS[model_name]}")
     assert avg_kl_div < ACC_THRESHOLDS[model_name]["kl_div"], (
         f"avg_kl_div={avg_kl_div} > threshold={ACC_THRESHOLDS[model_name]['kl_div']} "
@@ -133,13 +130,12 @@ def _generate(
     base_url, input_ids, max_new_tokens, return_logprob=False, logprob_start_len=-1
 ):
     """Send generate request and return results."""
-    max_input_ids_len = max([len(ids) for ids in input_ids])
     json_data = {
         "input_ids": input_ids,
         "sampling_params": {
-            "temperature": 1,
+            "temperature": 0,
             "max_new_tokens": max_new_tokens,
-            # "ignore_eos": True,
+            "ignore_eos": True,
         },
     }
     if return_logprob:
@@ -188,6 +184,8 @@ def test_input_output_logprobs_match_helper(
     input_ids = get_input_ids(tokenizer_path=model_name, num_samples=num_samples)
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
+
+    print([len(ids) for ids in input_ids])
     print(f"Running test_input_output_logprobs_match with {len(input_ids)} prompts")
 
     print("Flush Cache and Running generation to get output logprobs ...")
@@ -205,6 +203,7 @@ def test_input_output_logprobs_match_helper(
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
 
     compare_kl_divergence(
+        input_ids,
         input_logprobs,
         output_logprobs,
         ACC_THRESHOLDS,
@@ -212,14 +211,16 @@ def test_input_output_logprobs_match_helper(
         inspect.currentframe().f_code.co_name,
     )
 
-ACC_THRESHOLDS = {
-    "Qwen/Qwen3-30B-A3B": {"kl_div": 1e-9},
-}
 
-test_input_output_logprobs_match_helper(
-    base_url="http://127.0.0.1:30000", 
-    ACC_THRESHOLDS=ACC_THRESHOLDS, 
-    model_name="Qwen/Qwen3-30B-A3B",
-    max_samples=128,
-    max_new_tokens=1024,
-)
+if __name__ == "__main__":
+    # Example usage:
+    BASE_URL = "http://localhost:30000"  # Change to your server URL
+    QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+    ACC_THRESHOLDS = {
+        QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
+    }
+
+    test_input_output_logprobs_match_helper(
+        BASE_URL, ACC_THRESHOLDS, QWEN3_NEXT_MODEL, max_samples=256, max_new_tokens=512
+    )

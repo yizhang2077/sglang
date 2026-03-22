@@ -382,6 +382,16 @@ class GemmaRMSNorm(MultiPlatformOp):
         if _is_hip:
             self._forward_method = self.forward_native
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if get_global_server_args().rl_on_policy_target == "fsdp":
+            return self.forward_native(x, residual, post_residual_addition)
+        return self.forward_cuda(x, residual, post_residual_addition)
+
     def _forward_impl(
         self,
         x: torch.Tensor,

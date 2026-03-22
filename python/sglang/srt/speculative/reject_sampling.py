@@ -1,5 +1,7 @@
 import triton
 import triton.language as tl
+
+
 @triton.jit
 def speculative_sampling_classic_kernel(
     # Pointers
@@ -119,6 +121,7 @@ def speculative_sampling_classic_kernel(
                 found = 1
             cum_sum += tl.sum(val)
     tl.store(Predicts + last_accepted_global_idx, final_token)
+
 
 def chain_speculative_sampling_triton(
     predicts,

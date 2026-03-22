@@ -1000,6 +1000,10 @@ class Scheduler(
             self.truncation_align_size = None
             return
 
+        if get_int_env_var("SGLANG_GDN_PREFILL_TRUNCATION_ALIGN_SIZE", 64) is not None:
+            self.truncation_align_size = 64
+            return
+
         backend_sizes = {
             "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
             "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),

@@ -313,7 +313,7 @@ class CustomAllreduce:
             ops.register_graph_buffers(self._ptr, handles, offsets)
 
     def should_custom_ar(self, inp: torch.Tensor):
-        if self.disabled:
+        if self.disabled or os.getenv("SGLANG_DISABLE_CUSTOM_ALL_REDUCE", "0") == "1":
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16

@@ -163,6 +163,7 @@ def chunk_local_cumsum_scalar(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
+    forward_metadata=None,
 ) -> torch.Tensor:
     if head_first:
         B, H, T = g.shape
@@ -172,9 +173,12 @@ def chunk_local_cumsum_scalar(
         chunk_size.bit_length() - 1
     ), "chunk_size must be a power of 2"
     BT = chunk_size
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if forward_metadata is None:
+        chunk_indices = (
+            prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+        )
+    else:
+        chunk_indices = forward_metadata.chunk_indices_with_64
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
@@ -258,6 +262,7 @@ def chunk_local_cumsum(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
+    forward_metadata=None,
     **kwargs,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
@@ -273,6 +278,7 @@ def chunk_local_cumsum(
             cu_seqlens=cu_seqlens,
             head_first=head_first,
             output_dtype=output_dtype,
+            forward_metadata=forward_metadata,
         )
     elif len(g.shape) == 4:
         return chunk_local_cumsum_vector(

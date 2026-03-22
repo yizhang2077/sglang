@@ -6,19 +6,18 @@ import torch
 from torch.nn import functional as F
 from triton import next_power_of_2
 
-from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import alloc_token_slots
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -50,6 +49,7 @@ USE_CHAIN_SPECULATIVE_SAMPLING = get_bool_env_var("USE_CHAIN_SPECULATIVE_SAMPLIN
 USE_DECODE_TOPK_RENORM = get_bool_env_var("USE_DECODE_TOPK_RENORM", "false")
 USE_DECODE_TOPP_RENORM = get_bool_env_var("USE_DECODE_TOPP_RENORM", "false")
 VERIFY_CUDA_GRAPH_BS = get_int_env_var("VERIFY_CUDA_GRAPH_BS", 64)
+
 
 class DecodeVerifyRollbackWorker:
     def __init__(
@@ -95,12 +95,16 @@ class DecodeVerifyRollbackWorker:
 
     def init_attention_backend(self):
         self.decode_attention_backend = self.model_runner.attn_backend
-        self.target_verify_attention_backend = self.model_runner._get_attention_backend()
+        self.target_verify_attention_backend = (
+            self.model_runner._get_attention_backend()
+        )
 
     def init_cuda_graphs(self):
         self.model_runner.enable_dvr_target_verify_cuda_graph = True
         capture_bs = list(range(1, VERIFY_CUDA_GRAPH_BS + 1))
-        self.model_runner.server_args.cuda_graph_bs = [bs for bs in capture_bs if bs % get_attention_tp_size() == 0]
+        self.model_runner.server_args.cuda_graph_bs = (
+            capture_bs  # [bs for bs in capture_bs if bs % get_attention_tp_size() == 0]
+        )
         self.model_runner.attn_backend = self.target_verify_attention_backend
         if not self.model_runner.server_args.disable_cuda_graph:
             self.target_verify_cuda_graph_runner = CudaGraphRunner(self.model_runner)
@@ -147,7 +151,9 @@ class DecodeVerifyRollbackWorker:
                 can_run_cuda_graph=False,
             )
         else:
-            spec_info, can_run_cuda_graph = self.draft(batch)
+            with self._mamba_backup_conv_state(batch):
+                spec_info, can_run_cuda_graph = self.draft(batch)
+
             logits_output, verify_output, _ = self.verify(batch, spec_info)
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -177,7 +183,9 @@ class DecodeVerifyRollbackWorker:
             batch_result.logits_output,
             batch_result.next_token_ids,
         )
-        logits_output.next_token_logits = logits_output.next_token_logits.to(torch.float32)
+        logits_output.next_token_logits = logits_output.next_token_logits.to(
+            torch.float32
+        )
 
         batch.spec_info = EagleDraftInput(
             verified_id=next_token_ids,
@@ -392,6 +400,7 @@ class DecodeVerifyRollbackWorker:
         origin_seq_lens_cpu = forward_batch.seq_lens_cpu.clone()
         origin_spec_info = forward_batch.spec_info
         forward_batch.spec_info = None
+        topk_p = None
         for i in range(self.speculative_num_steps + 1):
             # step 0 is like draft_extend/draft_extend_after_decode
             if i == 0:
@@ -414,9 +423,12 @@ class DecodeVerifyRollbackWorker:
             forward_batch.seq_lens = origin_seq_lens + i + 1
             forward_batch.seq_lens_cpu = origin_seq_lens_cpu + i + 1
             logits_output = self.model_runner.forward(
-                forward_batch, skip_attn_backend_init=forward_batch.forward_mode.is_idle()
+                forward_batch,
+                skip_attn_backend_init=forward_batch.forward_mode.is_idle(),
             ).logits_output
-            logits_output.next_token_logits = logits_output.next_token_logits.to(torch.float32)
+            logits_output.next_token_logits = logits_output.next_token_logits.to(
+                torch.float32
+            )
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = self.get_renorm_probs(
@@ -448,6 +460,16 @@ class DecodeVerifyRollbackWorker:
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         # NOTE: do not need alloc cache loc for verify, share the same cache loc as draft/decoce
+        seq_lens_pre_verify = batch.seq_lens.clone()
+        if get_global_server_args().enable_mamba_extra_buffer():
+            batch.mamba_track_indices = torch.cat(
+                [
+                    req.mamba_ping_pong_track_buffer[
+                        req.mamba_next_track_idx
+                    ].unsqueeze(0)
+                    for req in batch.reqs
+                ],
+            ).to(torch.int64)
         if not batch.forward_mode.is_idle():
             batch.input_ids = spec_info.draft_token
         spec_info.num_tokens_per_batch = self.speculative_num_steps
@@ -472,7 +494,9 @@ class DecodeVerifyRollbackWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
-        logits_output.next_token_logits = logits_output.next_token_logits.to(torch.float32)
+        logits_output.next_token_logits = logits_output.next_token_logits.to(
+            torch.float32
+        )
         if self.server_args.enable_nan_detection:
             detect_nan(logits_output)
 
@@ -490,6 +514,11 @@ class DecodeVerifyRollbackWorker:
         logits_output.next_token_logits = logits_output.next_token_logits[
             res.accepted_indices
         ]
+
+        if self.target_worker.model_runner.hybrid_gdn_config is not None:
+            self._mamba_verify_update(
+                batch, res, logits_output, spec_info, seq_lens_pre_verify
+            )
 
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, res, logits_output)
@@ -524,3 +553,91 @@ class DecodeVerifyRollbackWorker:
 
     def clear_cache_pool(self):
         pass
+
+    def _mamba_verify_update(
+        self,
+        batch: ScheduleBatch,
+        res: EagleVerifyOutput,
+        logits_output: LogitsProcessorOutput,
+        spec_info: EagleVerifyInput,
+        seq_lens_pre_verify: torch.Tensor,
+    ):
+        accepted_length = (
+            torch.tensor(
+                res.accept_length_per_req_cpu,
+                device=logits_output.next_token_logits.device,
+                dtype=torch.int64,
+            )
+            + 1
+        )
+        cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
+        # prepend 0 to the cumulative_accepted_lengths
+        accepted_indices_start = torch.cat(
+            [
+                torch.zeros(
+                    1,
+                    dtype=cumulative_accepted_lengths.dtype,
+                    device=cumulative_accepted_lengths.device,
+                ),
+                cumulative_accepted_lengths[:-1],
+            ]
+        )
+        accepted_indices_offset = torch.arange(
+            0,
+            len(batch.seq_lens) * batch.spec_info.draft_token_num,
+            step=batch.spec_info.draft_token_num,
+            dtype=accepted_indices_start.dtype,
+            device=accepted_indices_start.device,
+        )
+
+        accepted_steps = accepted_length - 1
+
+        if batch.mamba_track_indices is not None:
+            # If after verify, the request's seq_lens has crossed a mamba track interval,
+            # we need to update the mamba state for the request at the crossing point.
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != batch.seq_lens // mamba_track_interval
+            )
+            tracking_point = (
+                batch.seq_lens // mamba_track_interval * mamba_track_interval
+            )
+            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+            mamba_steps_to_track = torch.where(
+                to_track_mask,
+                res.accepted_indices[to_track_ith + accepted_indices_start]
+                - accepted_indices_offset,
+                -1,
+            )
+        else:
+            mamba_steps_to_track = None
+
+        self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.target_worker.model_runner.model,
+        )
+
+    @contextlib.contextmanager
+    def _mamba_backup_conv_state(self, batch: ScheduleBatch):
+        if not get_global_server_args().enable_mamba_extra_buffer():
+            try:
+                yield
+            finally:
+                return
+        hybrid_attn_backend = self.target_worker.model_runner.attn_backend
+        request_number = batch.batch_size()
+        mamba_caches = (
+            hybrid_attn_backend.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        )
+        conv_states = mamba_caches.conv[0]
+        dst_state_indices = torch.tensor(
+            [req.mamba_pool_idx for req in batch.reqs], device=conv_states.device
+        )
+        conv_states_backup = conv_states[:, dst_state_indices].clone()
+        try:
+            yield
+        finally:
+            conv_states[:, dst_state_indices] = conv_states_backup

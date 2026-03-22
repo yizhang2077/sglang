@@ -246,6 +246,11 @@ class RotaryEmbedding(MultiPlatformOp):
         cos, sin = cos_sin.chunk(2, dim=-1)
         return cos, sin
 
+    def forward(self, *args, **kwargs):
+        if get_global_server_args().rl_on_policy_target is not None:
+            return self.forward_native(*args, **kwargs)
+        return self.forward_cuda(*args, **kwargs)
+
     def forward_native(
         self,
         positions: torch.Tensor,
