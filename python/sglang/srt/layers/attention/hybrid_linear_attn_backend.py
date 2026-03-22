@@ -1599,7 +1599,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_v_state_cache.shape[4],
         )
 
-        # 2. update conv states for all requests using
+        # 2. update conv states for all requests using intermediate_conv_window_cache
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
@@ -1607,7 +1607,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             accepted_steps,
         )
 
-        # 3. Compact mamba states if needed
+        # 3. Compact mamba states if needed (position >= FLA_CHUNK_SIZE)
         kuwg_mask = (gdn_kuwg_start_pos >= FLA_CHUNK_SIZE).unsqueeze(1)
         kuwg_mask = kuwg_mask & (
             (
@@ -1663,7 +1663,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             use_qk_l2norm_in_kernel=True,
         )
 
-        # 4. update tracked conv states if needed
+        # 4. update tracked conv states
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
@@ -1671,7 +1671,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_steps_to_track,
         )
 
-        # 5. update buffer by shifting if needed
+        # 5. update buffer by shifting if needed (position >= FLA_CHUNK_SIZE)
         shift_buffers(
             buffer_list,
             intermediate_kvug_pos,
@@ -1680,7 +1680,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             FLA_CHUNK_SIZE,
         )
 
-        # 6. Update ssm states for decode stage
+        # 6. Update ssm states for decode stage by recompute
         # build mask: accept steps >= 0 and position < gdn_kuwg_start_pos
         if get_global_server_args().speculative_algorithm != "DECODE_VERIFY_ROLLBACK":
             return
