@@ -40,4 +40,6 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 ### Reproduce Command for qwen3next
 ```
 SGLANG_GDN_PREFILL_TRUNCATION_ALIGN_SIZE=128 python -m sglang.launch_server --model-path Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2  --speculative-num-steps 15 --speculative-eagle-topk 1 --speculative-num-draft-tokens 16 --speculative-algo DECODE_VERIFY_ROLLBACK  --mamba-scheduler-strategy extra_buffer --disable-overlap-schedule  --mamba-track-interval 64  --mem-frac 0.8   --max-running-requests 48
+
+python3 dvr_test.py
 ```
