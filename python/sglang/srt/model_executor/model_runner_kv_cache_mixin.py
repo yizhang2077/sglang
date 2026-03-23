@@ -149,7 +149,10 @@ class ModelRunnerKVCacheMixin:
         assert config is not None
 
         # reserve the memory for the intermediate mamba states used for spec dec
-        if not self.spec_algorithm.is_none() and not self.spec_algorithm.is_decode_verify_rollback():
+        if (
+            not self.spec_algorithm.is_none()
+            and not self.spec_algorithm.is_decode_verify_rollback()
+        ):
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
