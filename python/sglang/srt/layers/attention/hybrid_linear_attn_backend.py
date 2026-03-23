@@ -1581,8 +1581,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_q_state_cache,
             intermediate_k_state_cache,
             intermediate_v_state_cache,
-            intermediate_beta_state_cache,
             intermediate_g_state_cache,
+            intermediate_beta_state_cache,
         ]
 
         clear_buffers(
@@ -1598,6 +1598,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_k_state_cache.shape[4],
             intermediate_v_state_cache.shape[4],
         )
+        seq_len_per_request = draft_tokens_length + FLA_CHUNK_SIZE
+        max_group_layers_by_grid = max(1, 65535 // max(1, request_number * H))
+        max_group_layers = min(layer, max_group_layers_by_grid, 8)
+        state_stride_per_layer = ssm_states.shape[1]
 
         # 2. update conv states for all requests using intermediate_conv_window_cache
         fused_mamba_state_scatter_with_mask(
@@ -1631,50 +1635,18 @@ class HybridLinearAttnBackend(AttentionBackend):
             :, dst_state_indices, :
         ] * kuwg_mask.unsqueeze(0)
 
-        q_fused = q.view(1, -1, Hg, K)
-        k_fused = k.view(1, -1, Hg, K)
-        v_fused = v.view(1, -1, H, V)
-        g_fused = g.view(1, -1, H)
-        beta_fused = beta.view(1, -1, H)
-        ssm_states_fused = ssm_states.view(
-            -1, ssm_states.shape[2], ssm_states.shape[3], ssm_states.shape[4]
+        run_chunk_gated_delta_rule_grouped(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states,
+            mamba_track_indices,
+            max_group_layers,
+            seq_len_per_request,
+            state_stride_per_layer,
         )
-        query_len_per_layer = query_start_loc[-1]
-        cu_seqlens_fused = torch.cat(
-            [query_start_loc[1:] + l * query_len_per_layer for l in range(layer)]
-        )
-        cu_seqlens_fused = torch.cat(
-            [torch.tensor([0], device=cu_seqlens_fused.device), cu_seqlens_fused]
-        )
-        mamba_track_indices_fused = torch.cat(
-            [mamba_track_indices + l * ssm_states.shape[1] for l in range(layer)]
-        )
-
-        for i in range(layer):
-            chunk_gated_delta_rule(
-                q=q[i].view(1, -1, Hg, K),
-                k=k[i].view(1, -1, Hg, K),
-                v=v[i].view(1, -1, H, V),
-                g=g[i].view(1, -1, H),
-                beta=beta[i].view(1, -1, H),
-                initial_state=ssm_states[i],
-                initial_state_indices=mamba_track_indices,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-        # chunk_gated_delta_rule(
-        #     q=q_fused,
-        #     k=k_fused,
-        #     v=v_fused,
-        #     g=g_fused,
-        #     beta=beta_fused,
-        #     initial_state=ssm_states_fused,
-        #     initial_state_indices=mamba_track_indices_fused,
-        #     cu_seqlens=cu_seqlens_fused,
-        #     head_first=False,
-        #     use_qk_l2norm_in_kernel=True,
-        # )
 
         # 4. update tracked conv states
         fused_mamba_state_scatter_with_mask(
@@ -1716,43 +1688,22 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         ssm_states[:, dst_state_indices, :] = ssm_states[:, mamba_track_indices]
 
-        q_fused = q.view(1, -1, Hg, K)
-        k_fused = k.view(1, -1, Hg, K)
-        v_fused = v.view(1, -1, H, V)
-        g_fused = g.view(1, -1, H)
-        beta_fused = beta.view(1, -1, H)
-        dst_state_indices_fused = torch.cat(
-            [dst_state_indices + l * ssm_states.shape[1] for l in range(layer)]
+        run_chunk_gated_delta_rule_grouped(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states,
+            dst_state_indices,
+            max_group_layers,
+            seq_len_per_request,
+            state_stride_per_layer,
         )
-        for i in range(layer):
-            chunk_gated_delta_rule(
-                q=q[i].view(1, -1, Hg, K),
-                k=k[i].view(1, -1, Hg, K),
-                v=v[i].view(1, -1, H, V),
-                g=g[i].view(1, -1, H),
-                beta=beta[i].view(1, -1, H),
-                initial_state=ssm_states[i],
-                initial_state_indices=dst_state_indices,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-        # chunk_gated_delta_rule(
-        #     q=q_fused.contiguous(),
-        #     k=k_fused.contiguous(),
-        #     v=v_fused.contiguous(),
-        #     g=g_fused.contiguous(),
-        #     beta=beta_fused.contiguous(),
-        #     initial_state=ssm_states_fused,
-        #     initial_state_indices=dst_state_indices_fused,
-        #     cu_seqlens=cu_seqlens_fused,
-        #     head_first=False,
-        #     use_qk_l2norm_in_kernel=True,
-        # )
 
 
 ###############################################################################################
-# mixin for update_mamba_state_after_mtp_verify to clear and shift buffers using triton kernels
+# vibe coding for update_mamba_state_after_mtp_verify to clear and shift buffers using triton kernels
 ###############################################################################################
 @triton.jit
 def _compute_valid_and_update_pos_kernel(
@@ -1819,16 +1770,15 @@ def _shift_5d_buffer_kernel(
     BLOCK_DIM: tl.constexpr,
 ):
     """
-    Grid: (num_requests, num_layers, cdiv(seq_len, BLOCK_SEQ))
+    Grid: (num_requests, num_layers)
 
-    For each (request, layer, seq_block):
-      - Iterate over heads and dim with tl.arange blocks.
-      - Shift seq_len dimension: src[FLA_CHUNK_SIZE:FLA_CHUNK_SIZE+draft] -> dst[0:draft]
-      - Zero out dst[draft:]
+    For each (request, layer):
+        - Iterate over seq blocks inside the kernel.
+        - Shift seq_len dimension: src[FLA_CHUNK_SIZE:FLA_CHUNK_SIZE+draft] -> dst[0:draft]
+        - Zero out dst[draft:]
     """
     pid_req = tl.program_id(0)
     pid_layer = tl.program_id(1)
-    pid_seq = tl.program_id(2)
 
     # Check if this request needs shifting (GPU-side, no sync)
     valid = tl.load(valid_mask_ptr + pid_req) != 0
@@ -1840,49 +1790,49 @@ def _shift_5d_buffer_kernel(
     # Base pointer for this (layer, state)
     base = pid_layer * stride_layer + dst_state_idx * stride_state
 
-    # Seq offsets for this block
-    seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
-
     # Head and dim offsets
     head_offsets = tl.arange(0, BLOCK_HEAD)
     dim_offsets = tl.arange(0, BLOCK_DIM)
+    head_off = head_offsets[None, :, None]
+    dim_off = dim_offsets[None, None, :]
 
-    # 3D offset grid: [BLOCK_SEQ, BLOCK_HEAD, BLOCK_DIM]
-    # Shape broadcasting: seq[:, None, None], head[None, :, None], dim[None, None, :]
-    seq_off = seq_offsets[:, None, None]  # [BLOCK_SEQ,  1,          1        ]
-    head_off = head_offsets[None, :, None]  # [1,          BLOCK_HEAD, 1        ]
-    dim_off = dim_offsets[None, None, :]  # [1,          1,          BLOCK_DIM]
+    for seq_start in tl.range(0, seq_len, BLOCK_SEQ):
+        seq_offsets = seq_start + tl.arange(0, BLOCK_SEQ)
+        seq_off = seq_offsets[:, None, None]
 
-    # ── Copy: src[FLA_CHUNK_SIZE : FLA_CHUNK_SIZE + draft] -> dst[0 : draft] ──
-    src_seq = seq_off + FLA_CHUNK_SIZE
-    copy_mask = (
-        (seq_offsets[:, None, None] < draft_tokens_length)
-        & (src_seq < seq_len)
-        & (head_off < num_heads)
-        & (dim_off < head_dim)
-    )
+        # ── Copy: src[FLA_CHUNK_SIZE : FLA_CHUNK_SIZE + draft] -> dst[0 : draft] ──
+        src_seq = seq_off + FLA_CHUNK_SIZE
+        copy_mask = (
+            (seq_offsets[:, None, None] < draft_tokens_length)
+            & (src_seq < seq_len)
+            & (head_off < num_heads)
+            & (dim_off < head_dim)
+        )
 
-    src_offsets = (
-        base + src_seq * stride_seq + head_off * stride_head + dim_off * stride_dim
-    )
-    data = tl.load(buffer_ptr + src_offsets, mask=copy_mask, other=0.0)
+        src_offsets = (
+            base + src_seq * stride_seq + head_off * stride_head + dim_off * stride_dim
+        )
+        data = tl.load(buffer_ptr + src_offsets, mask=copy_mask, other=0.0)
 
-    dst_offsets = (
-        base + seq_off * stride_seq + head_off * stride_head + dim_off * stride_dim
-    )
-    tl.store(buffer_ptr + dst_offsets, data, mask=copy_mask)
+        dst_offsets = (
+            base + seq_off * stride_seq + head_off * stride_head + dim_off * stride_dim
+        )
+        tl.store(buffer_ptr + dst_offsets, data, mask=copy_mask)
 
-    # ── Zero out: dst[draft_tokens_length : seq_len] ──
-    zero_seq = seq_off + draft_tokens_length
-    zero_mask = (zero_seq < seq_len) & (head_off < num_heads) & (dim_off < head_dim)
-    zero_offsets = (
-        base + zero_seq * stride_seq + head_off * stride_head + dim_off * stride_dim
-    )
-    tl.store(
-        buffer_ptr + zero_offsets,
-        tl.zeros([BLOCK_SEQ, BLOCK_HEAD, BLOCK_DIM], dtype=buffer_ptr.dtype.element_ty),
-        mask=zero_mask,
-    )
+        # ── Zero out: dst[draft_tokens_length : seq_len] ──
+        zero_seq = seq_off + draft_tokens_length
+        zero_mask = (zero_seq < seq_len) & (head_off < num_heads) & (dim_off < head_dim)
+        zero_offsets = (
+            base + zero_seq * stride_seq + head_off * stride_head + dim_off * stride_dim
+        )
+        tl.store(
+            buffer_ptr + zero_offsets,
+            tl.zeros(
+                [BLOCK_SEQ, BLOCK_HEAD, BLOCK_DIM],
+                dtype=buffer_ptr.dtype.element_ty,
+            ),
+            mask=zero_mask,
+        )
 
 
 @triton.jit
@@ -1907,14 +1857,13 @@ def _shift_4d_buffer_kernel(
     BLOCK_HEAD: tl.constexpr,
 ):
     """
-    Grid: (num_requests, num_layers, cdiv(seq_len, BLOCK_SEQ))
+    Grid: (num_requests, num_layers)
 
     Same as _shift_5d_buffer_kernel but for 4D buffers
     (intermediate_g and intermediate_beta which have no head_dim).
     """
     pid_req = tl.program_id(0)
     pid_layer = tl.program_id(1)
-    pid_seq = tl.program_id(2)
 
     valid = tl.load(valid_mask_ptr + pid_req) != 0
     if not valid:
@@ -1924,36 +1873,37 @@ def _shift_4d_buffer_kernel(
 
     base = pid_layer * stride_layer + dst_state_idx * stride_state
 
-    seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
     head_offsets = tl.arange(0, BLOCK_HEAD)
+    head_off = head_offsets[None, :]
 
-    seq_off = seq_offsets[:, None]  # [BLOCK_SEQ,  1         ]
-    head_off = head_offsets[None, :]  # [1,          BLOCK_HEAD]
+    for seq_start in tl.range(0, seq_len, BLOCK_SEQ):
+        seq_offsets = seq_start + tl.arange(0, BLOCK_SEQ)
+        seq_off = seq_offsets[:, None]
 
-    # ── Copy ──
-    src_seq = seq_off + FLA_CHUNK_SIZE
-    copy_mask = (
-        (seq_offsets[:, None] < draft_tokens_length)
-        & (src_seq < seq_len)
-        & (head_off < num_heads)
-    )
+        # ── Copy ──
+        src_seq = seq_off + FLA_CHUNK_SIZE
+        copy_mask = (
+            (seq_offsets[:, None] < draft_tokens_length)
+            & (src_seq < seq_len)
+            & (head_off < num_heads)
+        )
 
-    src_offsets = base + src_seq * stride_seq + head_off * stride_head
-    data = tl.load(buffer_ptr + src_offsets, mask=copy_mask, other=0.0)
+        src_offsets = base + src_seq * stride_seq + head_off * stride_head
+        data = tl.load(buffer_ptr + src_offsets, mask=copy_mask, other=0.0)
 
-    dst_offsets = base + seq_off * stride_seq + head_off * stride_head
-    tl.store(buffer_ptr + dst_offsets, data, mask=copy_mask)
+        dst_offsets = base + seq_off * stride_seq + head_off * stride_head
+        tl.store(buffer_ptr + dst_offsets, data, mask=copy_mask)
 
-    # ── Zero out ──
-    zero_seq = seq_off + draft_tokens_length
-    zero_mask = (zero_seq < seq_len) & (head_off < num_heads)
+        # ── Zero out ──
+        zero_seq = seq_off + draft_tokens_length
+        zero_mask = (zero_seq < seq_len) & (head_off < num_heads)
 
-    zero_offsets = base + zero_seq * stride_seq + head_off * stride_head
-    tl.store(
-        buffer_ptr + zero_offsets,
-        tl.zeros([BLOCK_SEQ, BLOCK_HEAD], dtype=buffer_ptr.dtype.element_ty),
-        mask=zero_mask,
-    )
+        zero_offsets = base + zero_seq * stride_seq + head_off * stride_head
+        tl.store(
+            buffer_ptr + zero_offsets,
+            tl.zeros([BLOCK_SEQ, BLOCK_HEAD], dtype=buffer_ptr.dtype.element_ty),
+            mask=zero_mask,
+        )
 
 
 def shift_buffers(
@@ -1982,10 +1932,7 @@ def shift_buffers(
         return
 
     # Reuse pre-allocated valid_mask if provided
-    if _valid_mask_cache is not None and _valid_mask_cache.shape[0] >= num_requests:
-        valid_mask = _valid_mask_cache[:num_requests]
-    else:
-        valid_mask = torch.empty(num_requests, dtype=torch.int32, device=device)
+    valid_mask = torch.zeros(num_requests, dtype=torch.int32, device=device)
 
     # ── Step 1: Compute valid_mask and update kvug_pos in-place ──
     _compute_valid_and_update_pos_kernel[(num_requests, num_layers)](
@@ -2013,7 +1960,6 @@ def shift_buffers(
         grid = (
             num_requests,
             num_layers_,
-            triton.cdiv(draft_tokens_length + (seq_len - FLA_CHUNK_SIZE), BLOCK_SEQ),
         )
 
         _shift_5d_buffer_kernel[grid](
@@ -2049,7 +1995,6 @@ def shift_buffers(
         grid = (
             num_requests,
             num_layers_,
-            triton.cdiv(seq_len, BLOCK_SEQ),
         )
 
         _shift_4d_buffer_kernel[grid](
@@ -2271,4 +2216,69 @@ def clear_buffers(
             num_requests,
             BLOCK_SEQ=BLOCK_SEQ,
             BLOCK_HEAD=BLOCK_HEAD,
+        )
+
+
+def run_chunk_gated_delta_rule_grouped(
+    q_states: torch.Tensor,
+    k_states: torch.Tensor,
+    v_states: torch.Tensor,
+    g_states: torch.Tensor,
+    beta_states: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    max_group_layers: int,
+    seq_len_per_request: int,
+    state_stride_per_layer: int,
+):
+    layer = q_states.shape[0]
+    request_number = initial_state_indices.shape[0]
+    Hg, H, K, V = (
+        k_states.shape[3],
+        v_states.shape[3],
+        k_states.shape[4],
+        v_states.shape[4],
+    )
+    for layer_start in range(0, layer, max_group_layers):
+        layer_end = min(layer_start + max_group_layers, layer)
+        group_layers = layer_end - layer_start
+        group_q = q_states[layer_start:layer_end].contiguous().view(1, -1, Hg, K)
+        group_k = k_states[layer_start:layer_end].contiguous().view(1, -1, Hg, K)
+        group_v = v_states[layer_start:layer_end].contiguous().view(1, -1, H, V)
+        group_g = g_states[layer_start:layer_end].contiguous().view(1, -1, H)
+        group_beta = beta_states[layer_start:layer_end].contiguous().view(1, -1, H)
+        group_initial_state = (
+            initial_state[layer_start:layer_end]
+            .contiguous()
+            .view(
+                -1,
+                initial_state.shape[2],
+                initial_state.shape[3],
+                initial_state.shape[4],
+            )
+        )
+        group_cu_seqlens = torch.arange(
+            0,
+            group_layers * seq_len_per_request * request_number + 1,
+            seq_len_per_request,
+            device=initial_state.device,
+        )
+        group_initial_state_indices = torch.cat(
+            [
+                initial_state_indices + local_layer * state_stride_per_layer
+                for local_layer in range(group_layers)
+            ]
+        )
+        chunk_gated_delta_rule(
+            q=group_q,
+            k=group_k,
+            v=group_v,
+            g=group_g,
+            beta=group_beta,
+            initial_state=group_initial_state,
+            initial_state_indices=group_initial_state_indices,
+            cu_seqlens=group_cu_seqlens,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+            compute_o=False,
         )

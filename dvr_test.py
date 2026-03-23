@@ -106,7 +106,8 @@ def compare_kl_divergence(
         output_logprob = np.array(output_logprob)
         logr = input_logprob - output_logprob
         if np.any(logr > 0):
-            print(f"{input_ids[i]=}")
+            print(f"{i=} {input_ids[i]=}")
+            print(f"{logr=}")
         kl_approx = (np.exp(logr) - 1) - logr
         kl_divs.append(np.mean(kl_approx))
         i += 1
@@ -222,5 +223,5 @@ if __name__ == "__main__":
     }
 
     test_input_output_logprobs_match_helper(
-        BASE_URL, ACC_THRESHOLDS, QWEN3_NEXT_MODEL, max_samples=256, max_new_tokens=512
+        BASE_URL, ACC_THRESHOLDS, QWEN3_NEXT_MODEL, max_samples=512, max_new_tokens=512
     )
