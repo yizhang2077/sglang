@@ -1585,22 +1585,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_g_state_cache,
         ]
 
-        # clear_buffers(
-        #     buffer_list,
-        #     intermediate_kvug_pos,
-        #     dst_state_indices,
-        # )
+        clear_buffers(
+            buffer_list,
+            intermediate_kvug_pos,
+            dst_state_indices,
+        )
         gdn_kuwg_start_pos = intermediate_kvug_pos[0, dst_state_indices]
-
-        def _clear_larger_than_accept_length(buffer: torch.Tensor):
-            for i in range(request_number):
-                buffer[:, dst_state_indices[i], gdn_kuwg_start_pos[i] :] = 0
-
-        _clear_larger_than_accept_length(intermediate_q_state_cache)
-        _clear_larger_than_accept_length(intermediate_k_state_cache)
-        _clear_larger_than_accept_length(intermediate_v_state_cache)
-        _clear_larger_than_accept_length(intermediate_g_state_cache)
-        _clear_larger_than_accept_length(intermediate_beta_state_cache)
 
         Hg, H, K, V = (
             intermediate_k_state_cache.shape[3],
@@ -1674,11 +1664,11 @@ class HybridLinearAttnBackend(AttentionBackend):
                 use_qk_l2norm_in_kernel=True,
             )
         # chunk_gated_delta_rule(
-        #     q=q_fused.contiguous(),
-        #     k=k_fused.contiguous(),
-        #     v=v_fused.contiguous(),
-        #     g=g_fused.contiguous(),
-        #     beta=beta_fused.contiguous(),
+        #     q=q_fused,
+        #     k=k_fused,
+        #     v=v_fused,
+        #     g=g_fused,
+        #     beta=beta_fused,
         #     initial_state=ssm_states_fused,
         #     initial_state_indices=mamba_track_indices_fused,
         #     cu_seqlens=cu_seqlens_fused,
@@ -1695,30 +1685,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
         # 5. update buffer by shifting if needed (position >= FLA_CHUNK_SIZE)
-        # shift_buffers(
-        #     buffer_list,
-        #     intermediate_kvug_pos,
-        #     dst_state_indices,
-        #     draft_tokens_length,
-        #     FLA_CHUNK_SIZE,
-        # )
-        def _shift_buffer(buffer: torch.Tensor, dst_state_indice: torch.Tensor):
-            buffer[:, dst_state_indice, :draft_tokens_length] = buffer[
-                :,
-                dst_state_indice,
-                FLA_CHUNK_SIZE : FLA_CHUNK_SIZE + draft_tokens_length,
-            ]
-            buffer[:, dst_state_indice, draft_tokens_length:] = 0
-
-        for i in range(request_number):
-            dst_state_indice = dst_state_indices[i]
-            if intermediate_kvug_pos[0, dst_state_indice] >= FLA_CHUNK_SIZE:
-                _shift_buffer(intermediate_q_state_cache, dst_state_indice)
-                _shift_buffer(intermediate_k_state_cache, dst_state_indice)
-                _shift_buffer(intermediate_v_state_cache, dst_state_indice)
-                _shift_buffer(intermediate_beta_state_cache, dst_state_indice)
-                _shift_buffer(intermediate_g_state_cache, dst_state_indice)
-                intermediate_kvug_pos[:, dst_state_indice] -= FLA_CHUNK_SIZE
+        shift_buffers(
+            buffer_list,
+            intermediate_kvug_pos,
+            dst_state_indices,
+            draft_tokens_length,
+            FLA_CHUNK_SIZE,
+        )
 
         # 6. Update ssm states for decode stage by recompute
         # build mask: accept steps >= 0 and position < gdn_kuwg_start_pos
